@@ -287,10 +287,8 @@ fn build_profile_dir_from_out_dir(out_dir: &Path) -> Option<&Path> {
 /// 1.100) moves intermediate artifacts away from the target directory: the
 /// executable still lands in `<target>[/<triple>]/<profile>`, so staged files
 /// must follow it there instead of sitting next to the build script output.
-/// The split is only detectable when configured through the
-/// `CARGO_BUILD_BUILD_DIR` environment variable — a `build-dir` set in
-/// `.cargo/config.toml` is not visible to build scripts, and that case still
-/// stages into the build dir.
+/// Cargo metadata resolves both environment and `.cargo/config.toml`
+/// configuration, including template variables in `build-dir`.
 fn artifact_profile_dir(build_profile_dir: &Path) -> PathBuf {
   fn resolve(build_profile_dir: &Path) -> Option<PathBuf> {
     // `cargo metadata` reports both roots with config and template variables
@@ -316,10 +314,49 @@ fn artifact_profile_dir(build_profile_dir: &Path) -> PathBuf {
     Some(target_directory.join(profile_suffix))
   }
 
-  if env::var_os("CARGO_BUILD_BUILD_DIR").is_none() {
-    return build_profile_dir.to_path_buf();
-  }
   resolve(build_profile_dir).unwrap_or_else(|| build_profile_dir.to_path_buf())
+}
+
+/// Stage the CEF runtime beside final artifacts even when Cargo moves build
+/// script output elsewhere. cef-dll-sys cannot infer the consuming app's target
+/// directory from its own OUT_DIR under build.build-dir.
+fn stage_cef_runtime(cef_dir: &Path, target_dir: &Path) -> Result<()> {
+  let standard = cef_dir.join("Release").is_dir();
+  let sources = if standard {
+    vec![cef_dir.join("Release"), cef_dir.join("Resources")]
+  } else {
+    vec![cef_dir.to_path_buf()]
+  };
+  fs::create_dir_all(target_dir)?;
+  for source in sources {
+    println!("cargo:rerun-if-changed={}", source.display());
+    for entry in walkdir::WalkDir::new(&source)
+      .follow_links(true)
+      .into_iter()
+      .filter_entry(|e| {
+        standard
+          || e.depth() == 0
+          || e.path().strip_prefix(&source).is_ok_and(|p| {
+            p.components()
+              .next()
+              .is_some_and(|c| c.as_os_str() == OsStr::new("locales"))
+          })
+          || (e.depth() == 1 && e.file_type().is_file())
+      })
+    {
+      let entry = entry?;
+      if entry.depth() == 0 {
+        continue;
+      }
+      let destination = target_dir.join(entry.path().strip_prefix(&source)?);
+      if entry.file_type().is_dir() {
+        fs::create_dir_all(destination)?;
+      } else if entry.file_type().is_file() {
+        copy_file(entry.path(), destination)?;
+      }
+    }
+  }
+  Ok(())
 }
 
 // creates a cfg alias if `has_feature` is true.
@@ -902,6 +939,10 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   }
 
   if target_triple.contains("unknown-linux-gnu") && uses_cef_runtime() {
+    println!("cargo:rerun-if-env-changed=DEP_TAURI_RUNTIME_CEF_CEF_DIR");
+    if let Some(cef_dir) = env::var_os("DEP_TAURI_RUNTIME_CEF_CEF_DIR") {
+      stage_cef_runtime(Path::new(&cef_dir), &target_dir)?;
+    }
     // The executable links against libcef.so, which sits next to it: the
     // cef-dll-sys build script copies the CEF distribution into the cargo
     // target directory for dev, and the bundler ships it alongside the binary
