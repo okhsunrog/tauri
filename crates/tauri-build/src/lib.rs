@@ -352,6 +352,17 @@ fn stage_cef_runtime(cef_dir: &Path, target_dir: &Path) -> Result<()> {
       if entry.file_type().is_dir() {
         fs::create_dir_all(destination)?;
       } else if entry.file_type().is_file() {
+        if destination.is_file()
+          && fs::canonicalize(entry.path())? == fs::canonicalize(&destination)?
+        {
+          continue;
+        }
+        // Store-backed SDKs copy read-only permissions into Cargo artifacts.
+        // Unlink the old artifact before copying so incremental staging does
+        // not try to overwrite a read-only file (or follow an SDK symlink).
+        if destination.is_file() || destination.is_symlink() {
+          fs::remove_file(&destination)?;
+        }
         copy_file(entry.path(), destination)?;
       }
     }
