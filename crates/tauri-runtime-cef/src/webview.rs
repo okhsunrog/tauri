@@ -525,6 +525,14 @@ pub(crate) struct AppWebview {
   pub(crate) bounds_rate: Option<BoundsRate>,
   pub(crate) offscreen: Option<crate::OffscreenView>,
   pub(crate) page_fullscreen: PageFullscreen,
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  ))]
+  pub(crate) linux_native: crate::platform::linux::LinuxWebviewState,
 }
 
 /// Whether the page shows an element through the HTML Fullscreen API, as CEF reports it to
@@ -670,6 +678,14 @@ impl<T: UserEvent> WinitCefApp<T> {
     let app_wide_theme = *context.app_wide_theme.lock().unwrap();
     let theme = appwindow.resolved_theme(app_wide_theme);
     let Some(child) = Self::build_browser_child(
+      #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+      ))]
+      appwindow,
       context,
       scheme_registry,
       appwindow.id,
@@ -705,6 +721,14 @@ impl<T: UserEvent> WinitCefApp<T> {
   }
 
   pub(crate) fn build_browser_child(
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    appwindow: &AppWindow,
     context: &RuntimeContext<T>,
     scheme_registry: &request_handler::SchemeRegistry,
     window_id: WindowId,
@@ -839,6 +863,14 @@ impl<T: UserEvent> WinitCefApp<T> {
       position: PhysicalPosition::new(0, 0).into(),
       size: parent_size.into(),
     });
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    let linux_native = crate::platform::linux::LinuxWebviewState::new(appwindow, bounds);
     #[cfg(not(target_os = "macos"))]
     let bounds = bounds.to_physical::<i32, i32>(scale);
     #[cfg(target_os = "macos")]
@@ -857,11 +889,42 @@ impl<T: UserEvent> WinitCefApp<T> {
       None => cef::RuntimeStyle::DEFAULT,
     };
 
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    let bounds = if crate::platform::linux::is_wayland() {
+      let (ox, oy) = *appwindow.cef_host.offset.lock().unwrap();
+      cef::Rect {
+        x: (bounds.x as f64 / scale).round() as i32 + ox,
+        y: (bounds.y as f64 / scale).round() as i32 + oy,
+        width: (bounds.width as f64 / scale).round() as i32,
+        height: (bounds.height as f64 / scale).round() as i32,
+      }
+    } else {
+      bounds
+    };
+
     let window_info = if let Some(options) = &pending.runtime_specific_attributes.offscreen {
       options.window_info(parent)
     } else {
       let mut info = cef::WindowInfo::default().set_as_child(parent, &bounds);
       info.runtime_style = cef_runtime_style;
+      #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+      ))]
+      if crate::platform::linux::is_wayland() {
+        // Native Wayland embedding is an Alloy child. GTK does not expose its
+        // xdg_surface; leave parent_xdg_surface null and use CEF's popup fallback.
+        info.runtime_style = cef::RuntimeStyle::ALLOY;
+      }
       info
     };
     let mut settings =
@@ -990,6 +1053,14 @@ impl<T: UserEvent> WinitCefApp<T> {
             bounds_rate,
             offscreen,
             page_fullscreen: Default::default(),
+            #[cfg(any(
+              target_os = "linux",
+              target_os = "dragonfly",
+              target_os = "freebsd",
+              target_os = "netbsd",
+              target_os = "openbsd"
+            ))]
+            linux_native,
           })
           .expect("failed to send initialized CEF browser");
       }
@@ -1138,6 +1209,19 @@ impl<T: UserEvent> WinitCefApp<T> {
         }
       }
       WebviewMessage::Reparent(target_window_id, tx) => {
+        #[cfg(any(
+          target_os = "linux",
+          target_os = "dragonfly",
+          target_os = "freebsd",
+          target_os = "netbsd",
+          target_os = "openbsd"
+        ))]
+        if crate::platform::linux::is_wayland() && window_id != target_window_id {
+          let _ = tx.send(Err(Error::CreateWebview(
+            "Wayland browser reparenting is not supported by CEF".into(),
+          )));
+          return;
+        }
         // CEF fixes an OSR browser's native dialog parent at creation.
         if appwindow.children[child_index].offscreen.is_some() && window_id != target_window_id {
           let _ = tx.send(Err(Error::CreateWebview(

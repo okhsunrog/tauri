@@ -12,8 +12,28 @@ use crate::{webview::AppWebview, window::AppWindow};
 
 use super::utils::{atom, with_cef_display};
 
+/// Requested layout is cached because Wayland has no XGetGeometry equivalent.
+pub(crate) struct LinuxWebviewState {
+  bounds: std::cell::RefCell<Rect>,
+  offset: std::sync::Arc<std::sync::Mutex<(i32, i32)>>,
+  area: gtk::Box,
+}
+
+impl LinuxWebviewState {
+  pub(crate) fn new(parent: &AppWindow, bounds: Rect) -> Self {
+    Self {
+      bounds: std::cell::RefCell::new(bounds),
+      offset: parent.cef_host.offset.clone(),
+      area: parent.cef_host.default_vbox(),
+    }
+  }
+}
+
 impl AppWebview {
   pub(crate) fn native_parent_matches(&self, parent: &AppWindow) -> Option<bool> {
+    if super::is_wayland() {
+      return None;
+    }
     let xid = self.host.window_handle();
     if xid == 0 {
       return None;
@@ -40,6 +60,9 @@ impl AppWebview {
   }
 
   pub(crate) fn native_visible(&self) -> Option<bool> {
+    if super::is_wayland() {
+      return None;
+    }
     let xid = self.host.window_handle();
     if xid == 0 {
       return None;
@@ -69,6 +92,9 @@ impl AppWebview {
   pub(crate) fn bounds(&self) -> Option<Rect> {
     if let Some(view) = &self.offscreen {
       return Some(view.bounds());
+    }
+    if super::is_wayland() {
+      return Some(*self.linux_native.bounds.borrow());
     }
     let xid = self.xid();
 
@@ -104,6 +130,7 @@ impl AppWebview {
   }
 
   pub(crate) fn reparent(&self, parent: &AppWindow) {
+    debug_assert!(!super::is_wayland());
     let xid = self.xid();
     // Linux reparents into the GTK content-area X11 host, unlike Windows/macOS
     // where the CEF host handle is the native window/view.
@@ -116,6 +143,14 @@ impl AppWebview {
   }
 
   pub(crate) fn apply_visible(&self, visible: bool) {
+    if super::is_wayland() {
+      if !visible {
+        log::warn!(
+          "hiding an individual native Wayland webview is not supported; hide its window instead"
+        );
+      }
+      return;
+    }
     let xid = self.xid();
 
     with_cef_display((), |xlib, display| unsafe {
@@ -151,7 +186,24 @@ impl AppWebview {
     });
   }
 
-  pub(crate) fn apply_physical_bounds(&self, _scale: f64, x: i32, y: i32, width: i32, height: i32) {
+  pub(crate) fn apply_physical_bounds(&self, scale: f64, x: i32, y: i32, width: i32, height: i32) {
+    if super::is_wayland() {
+      use gtk::prelude::*;
+      *self.linux_native.bounds.borrow_mut() = Rect {
+        position: PhysicalPosition::new(x, y).into(),
+        size: PhysicalSize::new(width.max(1) as u32, height.max(1) as u32).into(),
+      };
+      let (ox, oy) = *self.linux_native.offset.lock().unwrap();
+      self.host.set_window_bounds(Some(&cef::Rect {
+        x: (x as f64 / scale).round() as i32 + ox,
+        y: (y as f64 / scale).round() as i32 + oy,
+        width: (width as f64 / scale).round().max(1.) as i32,
+        height: (height as f64 / scale).round().max(1.) as i32,
+      }));
+      // Subsurface positions become visible with the parent's next commit.
+      self.linux_native.area.queue_draw();
+      return;
+    }
     let xid = self.xid();
 
     with_cef_display((), |xlib, display| unsafe {

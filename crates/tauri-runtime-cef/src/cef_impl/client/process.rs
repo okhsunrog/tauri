@@ -52,10 +52,17 @@ wrap_browser_process_handler! {
       // ANGLE backend or a feature flag the GPU process must see for WebGPU
       // find an adapter, say. Appending them here, in the browser process, is
       // the supported way to get them there.
-      crate::runtime::append_command_line_args(
-        command_line,
-        &self.child_process_command_line_args,
-      );
+      for argument in &self.child_process_command_line_args {
+        let name = argument.0.trim_start_matches('-');
+        if matches!(name, "enable-features" | "disable-features") {
+          if let Some(value) = &argument.1 {
+            let features: Vec<String> = value.split(',').map(str::to_owned).collect();
+            crate::switches::append_merged_switch(command_line, name, &features);
+          }
+        } else {
+          crate::runtime::append_command_line_args(command_line, std::slice::from_ref(argument));
+        }
+      }
     }
 
     fn on_already_running_app_relaunch(

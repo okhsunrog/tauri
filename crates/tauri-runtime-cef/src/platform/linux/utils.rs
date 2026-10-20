@@ -30,6 +30,9 @@ pub(super) fn with_cef_display<R>(
   default: R,
   f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) -> R,
 ) -> R {
+  if super::is_wayland() {
+    return default;
+  }
   let Some(xlib) = XLIB.as_ref() else {
     return default;
   };
@@ -46,6 +49,9 @@ pub(super) fn with_cef_display<R>(
 }
 
 pub(super) fn with_x11<R>(default: R, f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) -> R) -> R {
+  if super::is_wayland() {
+    return default;
+  }
   let Some(xlib) = XLIB.as_ref() else {
     return default;
   };

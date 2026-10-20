@@ -42,7 +42,7 @@ mod window;
 mod window_builder;
 mod window_handle;
 
-pub use cef::sys::CEF_API_VERSION_LAST;
+pub use cef::sys::{CEF_API_VERSION_DEFAULT, CEF_API_VERSION_LAST};
 #[cfg(target_os = "macos")]
 pub use platform::macos::setup_application as prepare_macos_application;
 pub use runtime::*;

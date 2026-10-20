@@ -694,9 +694,9 @@ impl Cef {
   }
 
   /// CEF API version this process declares (`cef_api_hash`), defaulting to
-  /// `cef::sys::CEF_API_VERSION_LAST`. Child processes declare the same one.
+  /// `cef::sys::CEF_API_VERSION_DEFAULT`. Child processes declare the same one.
   ///
-  /// The Rust bindings are compiled for `CEF_API_VERSION_LAST` whatever is declared
+  /// The Rust bindings are compiled for `CEF_API_VERSION_DEFAULT` whatever is declared
   /// here. Declaring another version is only sound if the API the application uses is
   /// the same in both.
   #[must_use]
@@ -2803,7 +2803,7 @@ wrap_with_args! {
 /// Only children launched through `on_before_child_process_launch` get it: the
 /// processes Chromium starts itself (renderer, GPU, utility and, on Linux, the
 /// zygote). A process CEF starts another way, such as the crashpad handler if crash
-/// reporting is enabled, falls back to `CEF_API_VERSION_LAST`.
+/// reporting is enabled, falls back to `CEF_API_VERSION_DEFAULT`.
 ///
 /// On macOS, child processes run the `tauri-cef-helper` binary the bundler compiles
 /// (`crates/tauri-bundler/cef-helper/main.rs`), which parses this switch itself. Keep
@@ -2858,10 +2858,11 @@ pub fn run_cef_helper_process() {
   };
 
   // Declare the version the browser process passed, if any.
-  let version = child_process_api_version(std::env::args_os()).unwrap_or(sys::CEF_API_VERSION_LAST);
+  let version =
+    child_process_api_version(std::env::args_os()).unwrap_or(sys::CEF_API_VERSION_DEFAULT);
   // `cef_api_hash` returns NULL if the loaded libcef does not support the version, and
   // the next CEF call would crash.
-  if cef::api_hash(version, 0).is_null() {
+  if !declare_api_version(version) {
     panic!("the loaded CEF library does not support CEF API version {version}");
   }
   let mut app = TauriCefHelperApp::new();
@@ -3158,10 +3159,10 @@ impl<T: UserEvent> CefRuntime<T> {
     let api_version = runtime_args.runtime_init_attrs.api_version;
     let version = child_process_api_version(std::env::args_os())
       .or(api_version)
-      .unwrap_or(sys::CEF_API_VERSION_LAST);
+      .unwrap_or(sys::CEF_API_VERSION_DEFAULT);
     // `cef_api_hash` returns NULL if the loaded libcef does not support the version.
     // Log the details and return the same error as for a missing runtime.
-    if cef::api_hash(version, 0).is_null() {
+    if !declare_api_version(version) {
       log::error!("the loaded CEF library does not support CEF API version {version}");
       return Err(Error::WebviewRuntimeNotInstalled);
     }
@@ -3189,7 +3190,7 @@ impl<T: UserEvent> CefRuntime<T> {
 
     let Cef {
       command_line_args,
-      child_process_command_line_args,
+      mut child_process_command_line_args,
       disabled_features,
       enabled_features,
       deep_link_schemes,
@@ -3410,11 +3411,6 @@ impl<T: UserEvent> CefRuntime<T> {
     // CEF call that opens anything in the directory, which is `cef::initialize` below.
     crate::downgrade::prepare_root_cache_path(&cache_path, downgrade_policy);
 
-    // Force X11 usage on Linux.
-    //
-    // Applied to every process type rather than only the browser one: it is not certain
-    // that Chromium propagates `ozone-platform` to the GPU process, and getting it wrong
-    // there breaks rendering outright.
     #[cfg(any(
       target_os = "linux",
       target_os = "dragonfly",
@@ -3423,22 +3419,7 @@ impl<T: UserEvent> CefRuntime<T> {
       target_os = "openbsd"
     ))]
     {
-      internal_command_line_args.push(("--ozone-platform".to_string(), Some("x11".to_string())));
-      // CEF integration below uses XIDs for child windows/reparenting, so GDK must not honor an
-      // inherited `GDK_BACKEND=wayland`. `set_allowed_backends` alone is not enough: GDK reads
-      // `GDK_BACKEND` first and only intersects it with the allowed list, so an inherited
-      // `wayland` would leave no backend to open a display with.
-      //
-      // SAFETY: `std::env::set_var` is only unsafe because another thread may be reading the
-      // environment concurrently. This runs during runtime initialization, before any GTK, CEF or
-      // Tauri thread that could read it has been spawned. Note the value is inherited by child
-      // processes the app spawns later, which is intended for CEF's own subprocesses.
-      unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-      gtk::gdk::set_allowed_backends("x11");
       event_loop_builder.with_gtk4();
-
-      // the GTK pointers this runtime hands out are GTK 4 objects, whichever bindings the `tauri`
-      // crate was compiled against.
       tauri_runtime::gtk::declare_version(tauri_runtime::gtk::Version::V4);
     }
 
@@ -3454,6 +3435,18 @@ impl<T: UserEvent> CefRuntime<T> {
     let event_loop = event_loop_builder
       .build()
       .map_err(|e| Error::CreateWindow(Box::new(e)))?;
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    {
+      let backend = crate::platform::linux::initialize_display()?;
+      internal_command_line_args.push(("--ozone-platform".to_string(), Some(backend.into())));
+      child_process_command_line_args.push(("--ozone-platform".to_string(), Some(backend.into())));
+    }
     let proxy = event_loop.create_proxy();
     let (sender, receiver) = mpsc::channel();
     let context_initialized = Arc::new(AtomicBool::new(false));
@@ -4139,4 +4132,31 @@ mod deep_link_argument_tests {
     assert_eq!(filter(&["MYAPP://open"]), vec!["MYAPP://open".to_string()]);
     assert!(filter(&["myapp2://open", "myap://open"]).is_empty());
   }
+}
+
+/// Experimental Linux bindings must never be used with a versioned table layout.
+fn declare_api_version(version: i32) -> bool {
+  #[cfg(target_os = "linux")]
+  if version != sys::CEF_API_VERSION_DEFAULT {
+    log::error!(
+      "this CEF Wayland fork requires experimental ABI {}",
+      sys::CEF_API_VERSION_DEFAULT
+    );
+    return false;
+  }
+  let hash = cef::api_hash(version, 0);
+  if hash.is_null() {
+    return false;
+  }
+  #[cfg(target_os = "linux")]
+  {
+    // The experimental ABI has no compatibility promise. Check the generated
+    // platform hash as well as the version before touching any CEF vtable.
+    let loaded = unsafe { std::ffi::CStr::from_ptr(hash) };
+    if loaded.to_bytes_with_nul() != sys::CEF_API_HASH_999999 {
+      log::error!("loaded CEF experimental ABI hash differs from the Rust bindings");
+      return false;
+    }
+  }
+  true
 }

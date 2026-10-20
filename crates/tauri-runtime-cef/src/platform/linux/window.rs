@@ -17,7 +17,11 @@ use crate::window::AppWindow;
 
 use super::{taskbar, utils::set_wm_state};
 
-/// 24-bit X11 parent for CEF browser children.
+/// Native parent and GTK content geometry for CEF browser children.
+///
+/// On Wayland, borrow GTK's wl_surface and track content offsets in logical
+/// pixels. CEF owns the browser subsurface and receives layout updates through
+/// SetWindowBounds. The remaining hierarchy description applies to X11.
 ///
 /// GTK owns the toplevel layout and menu widgets, while CEF creates native X11
 /// child windows. This host is kept sized to GTK's content box so CEF renders
@@ -30,15 +34,18 @@ use super::{taskbar, utils::set_wm_state};
 ///   - GtkBox
 ///     - menu
 ///     - content GtkBox
-///   - CefX11Host, positioned over the content GtkBox
+///   - CefNativeHost, positioned over the content GtkBox
 ///     - CEF webview
 ///     - CEF webview
 ///     - CEF webview
-pub(crate) struct CefX11Host {
+pub(crate) struct CefNativeHost {
   default_vbox: gtk::Box,
+  /// Owned XID on X11; borrowed wl_surface pointer on Wayland.
   xid: c_ulong,
   colormap: c_ulong,
   geometry: Rc<HostGeometry>,
+  pub(crate) offset: std::sync::Arc<std::sync::Mutex<(i32, i32)>>,
+  wayland: bool,
   /// CSS provider currently backing this window's background color, kept so it can be removed
   /// from the display instead of accumulating one provider per `set_background_color` call.
   background_color_provider: RefCell<Option<gtk::CssProvider>>,
@@ -54,7 +61,7 @@ struct HostGeometry {
   needs_relayout: Cell<bool>,
 }
 
-impl CefX11Host {
+impl CefNativeHost {
   pub(crate) fn new(window: &dyn winit::window::Window) -> Option<Self> {
     use gtk::prelude::*;
 
@@ -70,9 +77,15 @@ impl CefX11Host {
     default_vbox.append(&webview_area);
     gtk_window.set_child(Some(&default_vbox));
 
-    let parent_xid = window_xid(window);
     let initial_size = window.surface_size();
-    let (xid, colormap) = create_cef_container(parent_xid, initial_size)?;
+    let (xid, colormap, wayland) = match window.window_handle().ok()?.as_raw() {
+      RawWindowHandle::Wayland(handle) => (handle.surface.as_ptr() as c_ulong, 0, true),
+      _ => {
+        let (xid, colormap) = create_cef_container(window_xid(window), initial_size)?;
+        (xid, colormap, false)
+      }
+    };
+    let offset = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
 
     let geometry = Rc::new(HostGeometry {
       size: Cell::new(initial_size),
@@ -83,13 +96,31 @@ impl CefX11Host {
       let gtk_window = gtk_window.clone();
       let layout_webview_area = webview_area.clone();
       let layout_geometry = geometry.clone();
+      let layout_offset = offset.clone();
       surface.connect_layout(move |surface, _, _| {
-        let size = set_cef_container_bounds(
-          xid,
-          &gtk_window,
-          &layout_webview_area,
-          surface.scale_factor().max(1) as f64,
-        );
+        let size = if wayland {
+          let point = layout_webview_area
+            .compute_point(&gtk_window, &gtk::graphene::Point::new(0.0, 0.0))
+            .unwrap_or_default();
+          let next = (point.x().round() as i32, point.y().round() as i32);
+          let mut offset = layout_offset.lock().unwrap();
+          if *offset != next {
+            layout_geometry.needs_relayout.set(true);
+            *offset = next;
+          }
+          let scale = surface.scale();
+          PhysicalSize::new(
+            (layout_webview_area.width() as f64 * scale).round() as u32,
+            (layout_webview_area.height() as f64 * scale).round() as u32,
+          )
+        } else {
+          set_cef_container_bounds(
+            xid,
+            &gtk_window,
+            &layout_webview_area,
+            surface.scale_factor().max(1) as f64,
+          )
+        };
         if layout_geometry.size.replace(size) != size {
           // The content area changed without the toplevel being resized - a menu bar was
           // attached, hidden or shown - so winit emits no `SurfaceResized` and the CEF children
@@ -104,6 +135,8 @@ impl CefX11Host {
       xid,
       colormap,
       geometry,
+      offset,
+      wayland,
       background_color_provider: RefCell::new(None),
       mapped: Cell::new(true),
     })
@@ -120,6 +153,9 @@ impl CefX11Host {
   }
 
   pub(crate) fn set_visible(&self, visible: bool) {
+    if self.wayland {
+      return;
+    }
     if self.mapped.replace(visible) == visible {
       return;
     }
@@ -150,7 +186,7 @@ impl CefX11Host {
   }
 }
 
-impl Drop for CefX11Host {
+impl Drop for CefNativeHost {
   fn drop(&mut self) {
     if let Some(provider) = self.background_color_provider.borrow_mut().take() {
       gtk::style_context_remove_provider_for_display(
@@ -159,6 +195,9 @@ impl Drop for CefX11Host {
       );
     }
 
+    if self.wayland {
+      return;
+    }
     super::utils::with_x11((), |xlib, display| unsafe {
       (xlib.XDestroyWindow)(display, self.xid);
       (xlib.XFreeColormap)(display, self.colormap);
@@ -176,7 +215,14 @@ impl AppWindow {
   }
 
   pub(crate) fn raise_native(&self) {
-    super::utils::activate_window(self.xid());
+    if super::is_wayland() {
+      use gtk::prelude::*;
+      if let Some(window) = self.window.gtk_window() {
+        window.present();
+      }
+    } else {
+      super::utils::activate_window(self.xid());
+    }
   }
 
   /// Applies the transient parent recorded by the window builder, if any.
@@ -251,10 +297,16 @@ impl AppWindow {
   }
 
   pub(crate) fn set_skip_taskbar(&self, skip: bool) {
+    if super::is_wayland() {
+      return;
+    }
     set_wm_state(self.xid(), skip, "_NET_WM_STATE_SKIP_TASKBAR", None);
   }
 
   pub(crate) fn set_visible_on_all_workspaces(&self, visible: bool) {
+    if super::is_wayland() {
+      return;
+    }
     set_wm_state(self.xid(), visible, "_NET_WM_STATE_STICKY", None);
   }
 

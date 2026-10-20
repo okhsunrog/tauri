@@ -492,7 +492,7 @@ pub(crate) struct AppWindow {
   ))]
   /// X11 parent for CEF browser children, sized to the GTK content area so
   /// GTK UI like menus stays outside the native CEF child-window stack.
-  pub(crate) cef_host: crate::platform::linux::CefX11Host,
+  pub(crate) cef_host: crate::platform::linux::CefNativeHost,
   /// Deadline for the initial raise of a window created focused, see
   /// [`WinitCefApp::apply_pending_activations`]. `None` once it has been
   /// raised or given up on.
@@ -794,9 +794,10 @@ impl<T: UserEvent> WinitCefApp<T> {
       target_os = "netbsd",
       target_os = "openbsd"
     ))]
-    let cef_host = crate::platform::linux::CefX11Host::new(window.as_ref()).ok_or_else(|| {
-      Error::CreateWindow("failed to create the X11 host for the CEF browser".into())
-    })?;
+    let cef_host =
+      crate::platform::linux::CefNativeHost::new(window.as_ref()).ok_or_else(|| {
+        Error::CreateWindow("failed to create the native host for the CEF browser".into())
+      })?;
 
     let winit_id = window.id();
     let pending_activation = (attrs.inner.active && attrs.inner.visible)
