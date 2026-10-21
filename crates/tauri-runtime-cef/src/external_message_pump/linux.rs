@@ -199,7 +199,7 @@ unsafe fn handle_prepare(source_state: *mut SourceState) -> c_int {
 unsafe fn handle_check(source_state: *mut SourceState) -> bool {
   // We usually have a single message on the wakeup pipe, since we are only
   // signaled when the queue went from empty to non-empty, but there can be
-  // two messages if a task posted a task, hence we read at most two bytes.
+  // two messages if a task posted a task, hence we read at most two messages.
   // The glib poll will tell us whether there was data, so this read shouldn't
   // block.
   let have_wakeup = {
@@ -219,7 +219,9 @@ unsafe fn handle_check(source_state: *mut SourceState) -> bool {
     if num_bytes < mem::size_of::<i64>() as isize {
       log::error!("error reading from the CEF message pump wakeup pipe");
     }
-    if num_bytes == mem::size_of::<i64>() as isize
+    // A fallback timer placeholder can follow an immediate request in the same
+    // read. Process both so the placeholder cannot discard the pending work.
+    if num_bytes >= mem::size_of::<i64>() as isize
       && let Some(state) = unsafe { (*source_state).state.upgrade() }
     {
       state.on_schedule_work(delay_ms[0]);
