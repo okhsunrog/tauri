@@ -28,9 +28,12 @@
 //! and event tracking on macOS). On Linux/BSD the GLib source still dispatches
 //! inside nested GLib loops (e.g. GTK menus/dialogs) for the same reason.
 
-use std::sync::{
-  Arc, Mutex,
-  atomic::{AtomicBool, Ordering},
+use std::{
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+  },
+  time::Duration,
 };
 
 #[cfg(any(
@@ -65,7 +68,7 @@ const K_TIMER_DELAY_PLACEHOLDER: i64 = i32::MAX as i64;
 
 // The maximum number of milliseconds we're willing to wait between calls to
 // DoWork().
-const K_MAX_TIMER_DELAY: i64 = 1000 / 30; // 30fps
+const K_MAX_TIMER_DELAY: i64 = 1000 / 30;
 
 /// Handle to the external message pump. Cloning shares the same underlying
 /// state; the backing platform resources are released when the last clone drops.
@@ -75,10 +78,11 @@ pub(crate) struct CefExternalPump {
 }
 
 impl CefExternalPump {
-  pub(crate) fn new() -> Self {
+  pub(crate) fn new(max_delay: Option<Duration>) -> Self {
     let state = Arc::new_cyclic(|weak| PumpState {
       is_active: AtomicBool::new(false),
       reentrancy_detected: AtomicBool::new(false),
+      max_timer_delay: timer_delay_ms(max_delay),
       platform: Mutex::new(PlatformPump::new(weak.clone())),
     });
 
@@ -101,6 +105,10 @@ impl CefExternalPump {
 struct PumpState {
   is_active: AtomicBool,
   reentrancy_detected: AtomicBool,
+  // CEF scheduling callbacks supplement periodic pumping; they do not cover
+  // every native task. Applications can choose a shorter interval to trade
+  // additional wakeups for lower frame latency.
+  max_timer_delay: i64,
   platform: Mutex<PlatformPump>,
 }
 
@@ -136,8 +144,8 @@ impl PumpState {
       self.do_work();
     } else if let Ok(mut platform) = self.platform.lock() {
       // Never wait longer than the maximum allowed time.
-      if delay_ms > K_MAX_TIMER_DELAY {
-        delay_ms = K_MAX_TIMER_DELAY;
+      if delay_ms > self.max_timer_delay {
+        delay_ms = self.max_timer_delay;
       }
 
       // Results in call to OnTimerTimeout() after the specified delay.
@@ -195,5 +203,27 @@ impl PumpState {
     // |reentrancy_detected_| may have changed due to re-entrant calls to this
     // method.
     self.reentrancy_detected.load(Ordering::SeqCst)
+  }
+}
+
+// A positive millisecond interval prevents a busy loop. Keep cefclient's upper
+// bound even if an application supplies a larger duration.
+fn timer_delay_ms(delay: Option<Duration>) -> i64 {
+  delay
+    .map(|delay| delay.as_millis().clamp(1, K_MAX_TIMER_DELAY as u128) as i64)
+    .unwrap_or(K_MAX_TIMER_DELAY)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn timer_interval_is_positive_and_bounded() {
+    assert_eq!(timer_delay_ms(None), 33);
+    assert_eq!(timer_delay_ms(Some(Duration::ZERO)), 1);
+    assert_eq!(timer_delay_ms(Some(Duration::from_micros(500))), 1);
+    assert_eq!(timer_delay_ms(Some(Duration::from_millis(4))), 4);
+    assert_eq!(timer_delay_ms(Some(Duration::MAX)), 33);
   }
 }

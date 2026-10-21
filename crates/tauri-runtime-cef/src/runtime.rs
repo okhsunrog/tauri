@@ -501,6 +501,7 @@ pub struct Cef {
   sandbox: SandboxPolicy,
   downgrade: DowngradePolicy,
   settings_callback: Option<Box<SettingsCallback>>,
+  message_pump_max_delay: Option<Duration>,
   window_event_handler: Option<Arc<NativeWindowEventHandler>>,
 }
 
@@ -543,6 +544,7 @@ impl fmt::Debug for Cef {
       .field("certificate_errors", &self.certificate_errors)
       .field("sandbox", &self.sandbox)
       .field("downgrade", &self.downgrade)
+      .field("message_pump_max_delay", &self.message_pump_max_delay)
       .field("settings_callback", &self.settings_callback.is_some())
       .field("window_event_handler", &self.window_event_handler.is_some())
       .finish()
@@ -550,6 +552,21 @@ impl fmt::Debug for Cef {
 }
 
 impl Cef {
+  /// Upper bound for timer delays requested by CEF's external message pump.
+  ///
+  /// Defaults to 33 milliseconds, matching cefclient. CEF's scheduling callbacks
+  /// supplement periodic pumping; they do not announce every native task. For
+  /// animation, a shorter interval can reduce missed frame deadlines at the cost
+  /// of additional wakeups and CPU use. This does not set the rendering frame rate.
+  ///
+  /// The interval is rounded down to whole milliseconds and clamped to 1..=33 ms.
+  /// Zero and submillisecond durations use 1 ms rather than continuously polling.
+  #[must_use]
+  pub fn message_pump_max_delay(mut self, delay: Duration) -> Self {
+    self.message_pump_max_delay = Some(delay);
+    self
+  }
+
   /// Observes native input, resize and redraw events without replacing Tauri's handling.
   ///
   /// Runs before Tauri handles the event. Offscreen embedders forward input, focus and IME
@@ -3217,6 +3234,7 @@ impl<T: UserEvent> CefRuntime<T> {
       sandbox: sandbox_policy,
       downgrade: downgrade_policy,
       settings_callback,
+      message_pump_max_delay,
       window_event_handler,
       // Already applied, above, before the first CEF call.
       api_version: _,
@@ -3450,7 +3468,7 @@ impl<T: UserEvent> CefRuntime<T> {
     let proxy = event_loop.create_proxy();
     let (sender, receiver) = mpsc::channel();
     let context_initialized = Arc::new(AtomicBool::new(false));
-    let cef_pump = CefExternalPump::new();
+    let cef_pump = CefExternalPump::new(message_pump_max_delay);
     let current_dispatch: Arc<MainThreadDispatchSlot<T>> = Default::default();
     #[cfg(target_os = "macos")]
     let wake = {
